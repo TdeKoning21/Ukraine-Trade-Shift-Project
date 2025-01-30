@@ -1,0 +1,495 @@
+---
+title: "Data Harmonization"
+author: "Teun de Koning"
+date: "14-12-2024"
+output: pdf_document
+fontsize: 11pt
+---
+
+## About this file
+This file will use several data sets to be combined for analysis. The analysis will be on the Ukrainian shift from trading mostly with Russia to trading with Europe and the possible effect of institutional changes. In order to analyse this, I will use the following data that we need:
+1. **Yearly Trade Data for Ukraine.** For this I will use data from the World Integrated Trade Solution (WITS). This will give me dyadic trade data from 1996 to 2022. I will retrieve the exports and imports for Ukraine separately.
+2. **GDP by Country by Year.** For the use of a gravity model I will import the GDP in current USD from the World Bank World Development Indicators. 
+3. **Capital Coordinates.** In order to use a gravity model I will need to calculate Distances between countries, for that I will use the coordinates of the capitals. For this I will use the dataset set up by GitHub user ofou. 
+4. **Institutional Variables.** For data on institutional changes I will use index for Political Rights and Civil Liberties from Freedom House. Which goes back to 1972. 
+
+## Loading Libraries
+```{r message = FALSE, warning = FALSE}
+library(here)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(openxlsx)
+library(geosphere)
+```
+
+## Yearly Trade Data for Ukraine.
+```{r message = FALSE, warning = FALSE}
+WITS_X_reg <- read_xlsx(here("Data", "WITS-Export-Regions.xlsx"), sheet = 2)
+WITS_M_reg <- read_xlsx(here("Data", "WITS-Import-Regions.xlsx"), sheet = 2)
+
+WITS <- bind_rows(WITS_M_reg, WITS_X_reg)
+WITS <- WITS %>%
+  select(-`Reporter Name`, -`Product Group`, -Indicator)
+
+#Excluding countries that only have imports or exports but not both.
+Excl_countries <- WITS %>%
+  group_by(`Partner Name`) %>%
+  count() %>%
+  filter(n == 1) %>%
+  pull(`Partner Name`)
+
+`%nin%` = Negate(`%in%`)
+WITS <- WITS %>%
+  filter(`Partner Name` %nin% Excl_countries)
+
+#Creating total Tradeflow
+WITS_2 <- WITS %>%
+  pivot_longer(`1996`:`2022`, names_to = "Year") %>%
+  pivot_wider(names_from = `Trade Flow`, values_from = value) %>%
+  mutate(Total = Import + Export) %>%
+  rename(Country = `Partner Name`) %>%
+  filter(!is.na(Total))
+
+#Separating countries from regions
+WITS_2 %>%
+  group_by(Country) %>%
+  slice_max(Total) %>%
+  arrange(Total)
+
+Regions <- c(
+  "World",
+  "East Asia & Pacific",
+  "Europe & Central Asia",
+  "Latin America & Caribbean",
+  "Middle East & North Africa",
+  "Other Asia, nes",
+  "South Asia",
+  "Sub-Saharan Africa",
+  "North America",
+  "Unspecified")
+
+World_trade_vol <- WITS_2 %>%
+  filter(Country == "World") %>%
+  select(Year, Total) %>%
+  rename(World_Trade_Volume = Total)
+
+WITS_3 <- WITS_2 %>%
+  filter(Country %nin% Regions) %>%
+  left_join(World_trade_vol, by = "Year")
+```
+
+## GDP by Country by Year
+```{r message = FALSE, warning = FALSE}
+WB_GDP <- read.csv(here("Data", "World_Bank_GDP.csv"))
+
+#Putting in long format and renaming.
+WB_GDP_2 <- WB_GDP %>%
+  pivot_longer(
+    cols = starts_with("X"),
+    names_to = "Year",
+    values_to = "GDP",
+    names_prefix = "X") %>%
+  mutate(
+    Year = str_extract(Year, "\\d{4}"),
+    Year = as.integer(Year),
+    GDP = as.numeric(GDP)) %>%
+  rename(
+    Country = Country.Name, 
+    Country_Code = Country.Code) %>%
+  filter(Series.Code != "") %>%
+  select(-Series.Name, -Series.Code)
+```
+
+## Capital Coordinates
+```{r message = FALSE, warning = FALSE}
+Cap_Coords <- read.csv(here("Data", "country-capital-lat-long-population.csv"))
+
+Cap_Coords <- Cap_Coords %>%
+  select(Country, Latitude, Longitude)
+```
+
+## Institutional Variables
+This dataset is very frustratingly formatted. It has merged cells, with three row headers.
+```{r message = FALSE, warning = FALSE}
+FH_bad <- read.xlsx(here("Data", "Country_and_Territory_Ratings_and_Statuses_FIW_1973-2024.xlsx"), 
+                    sheet = 2, 
+                    fillMergedCells = TRUE, 
+                    colNames = FALSE, 
+                    startRow = 2)
+
+headers <- FH_bad %>%
+  head(2)
+  
+new_names <- headers %>%
+  summarize(
+    across(
+      .fns = paste, 
+      collapse = "_")) %>%
+  unlist() %>% unname()
+
+FH_Index <- read_xlsx(here("Data", "Country_and_Territory_Ratings_and_Statuses_FIW_1973-2024.xlsx"), 
+                      sheet = 2, 
+                      col_names = new_names, 
+                      skip = 3)
+
+FH_Index_2 <- FH_Index %>%
+  rename(Country = `Year(s) Under Review_NA`) %>%
+  pivot_longer(
+    cols = -Country,
+    names_to = c("Year", "PRCL"),
+    names_sep = "_",
+    values_to = "val") %>%
+  filter(PRCL != "Status") %>%
+  pivot_wider(
+    names_from = PRCL,
+    values_from = val)
+```
+
+##Exploring Data
+Before I will combine all data into one dataset I will check if the country names and years are the same. And if countries are in all the datasets. 
+```{r message = FALSE, warning = FALSE}
+#Checking years
+WB_GDP_2 %>%
+  select(Year) %>%
+  unique() %>%
+  pull()
+
+FH_Index_2 %>%
+  select(Year) %>%
+  unique() %>%
+  pull()
+
+WITS_3 %>%
+  select(Year) %>%
+  unique() %>%
+  pull()
+
+#Most restrictive is the WITS_3 database from 1996-2022, so I will take that timeframe.
+
+#Checking which datasets have which countries in the chosen timeframe.
+
+Countries_1 <- WB_GDP_2 %>%
+  filter(Year %in% 1996:2022) %>%
+  select(Country) %>%
+  unique() %>%
+  mutate(WB = 1)
+
+Countries_2 <- FH_Index_2 %>%
+  filter(Year %in% 1996:2022,
+         CL %in% 1:7,
+         PR %in% 1:7) %>%
+  select(Country) %>%
+  unique() %>%
+  mutate(FH = 1)
+
+Countries_3 <- WITS_3 %>%
+  filter(Year %in% 1996:2022) %>%
+  select(Country) %>%
+  unique() %>%
+  mutate(WITS = 1)
+
+Countries_4 <- Cap_Coords %>%
+  select(Country) %>%
+  unique() %>%
+  mutate(Coords = 1)
+
+combination <- bind_rows(Countries_1, Countries_2, Countries_3, Countries_4) %>%
+  select(Country) %>%
+  left_join(Countries_1, by = "Country") %>%  
+  left_join(Countries_2, by = "Country") %>%
+  left_join(Countries_3, by = "Country") %>%
+  left_join(Countries_4, by = "Country") %>%
+  unique()
+
+diff_countries <- combination %>%
+  filter(is.na(WB) | is.na(FH) | is.na(WITS) | is.na(Coords))
+
+```
+
+##Harmonizing Country Names
+Some countries are named the same in all four datasets. Some countries do not show up in all datasets, but some countries show up differently in different datasets. Here I will change country names based on the diff_countries table, that show up in all four datasets but do not have the same name everywhere. I could write a function, however that wouldn't make the code much shorter.
+```{r message = FALSE, warning = FALSE}
+#WB
+WB_GDP_2[WB_GDP_2=="Bahamas, The"] <- "Bahamas"
+WB_GDP_2[WB_GDP_2=="Brunei Darussalam"] <- "Brunei"
+WB_GDP_2[WB_GDP_2=="Czechia"] <- "Czech Republic"
+WB_GDP_2[WB_GDP_2=="Korea, Dem. People's Rep."] <- "Korea, Dem. Rep."
+WB_GDP_2[WB_GDP_2=="Egypt, Arab Rep."] <- "Egypt"
+WB_GDP_2[WB_GDP_2=="Hong Kong SAR, China"] <- "Hong Kong"
+WB_GDP_2[WB_GDP_2=="Iran, Islamic Rep."] <- "Iran"
+WB_GDP_2[WB_GDP_2=="Kyrgyz Republic"] <- "Kyrgyzstan"
+WB_GDP_2[WB_GDP_2=="Lao PDR"] <- "Laos"
+WB_GDP_2[WB_GDP_2=="Macao SAR, China"] <- "Macao"
+WB_GDP_2[WB_GDP_2=="Slovak Republic"] <- "Slovakia"
+WB_GDP_2[WB_GDP_2=="Venezuela, RB"] <- "Venezuela"
+WB_GDP_2[WB_GDP_2=="Viet Nam"] <- "Vietnam"
+WB_GDP_2[WB_GDP_2=="Yemen, Rep."] <- "Yemen"
+WB_GDP_2[WB_GDP_2=="Turkiye"] <- "Turkey"
+
+#FH
+FH_Index_2[FH_Index_2=="Congo (Kinshasa)"] <- "Congo, Dem. Rep."
+FH_Index_2[FH_Index_2=="Congo (Brazzaville)"] <- "Congo, Rep."
+FH_Index_2[FH_Index_2=="North Korea"] <- "Korea, Dem. Rep."
+FH_Index_2[FH_Index_2=="The Gambia"] <- "Gambia, The"
+FH_Index_2[FH_Index_2=="South Korea"] <- "Korea, Rep."
+FH_Index_2[FH_Index_2=="Russia"] <- "Russian Federation"
+FH_Index_2[FH_Index_2=="Syria"] <- "Syrian Arab Republic"
+
+#WITS
+WITS_3[WITS_3=="Bahamas, The"] <- "Bahamas"
+WITS_3[WITS_3=="Cape Verde"] <- "Cabo Verde"
+WITS_3[WITS_3=="East Timor"] <- "Timor-Leste"
+WITS_3[WITS_3=="Egypt, Arab Rep."] <- "Egypt"
+WITS_3[WITS_3=="Ethiopia(excludes Eritrea)"] <- "Ethiopia"
+WITS_3[WITS_3=="Fm Sudan"] <- "Sudan" #Former Sudan
+WITS_3[WITS_3=="Hong Kong, China"] <- "Hong Kong"
+WITS_3[WITS_3=="Iran, Islamic Rep."] <- "Iran"
+WITS_3[WITS_3=="Kyrgyz Republic"] <- "Kyrgyzstan"
+WITS_3[WITS_3=="Lao PDR"] <- "Laos"
+WITS_3[WITS_3=="Serbia, FR(Serbia/Montenegro)"] <- "Serbia"
+WITS_3[WITS_3=="Slovak Republic"] <- "Slovakia"
+WITS_3[WITS_3=="Belgium-Luxembourg"] <- "Belgium" #Combination
+
+#Coords
+Cap_Coords[Cap_Coords=="Bolivia (Plurinational State of)"] <- "Bolivia"
+Cap_Coords[Cap_Coords=="Brunei Darussalam"] <- "Brunei"
+Cap_Coords[Cap_Coords=="Democratic Republic of the Congo"] <- "Congo, Dem. Rep."
+Cap_Coords[Cap_Coords=="Congo"] <- "Congo, Rep."
+Cap_Coords[Cap_Coords=="Côte d'Ivoire"] <- "Cote d'Ivoire"
+Cap_Coords[Cap_Coords=="Czechia"] <- "Czech Republic"
+Cap_Coords[Cap_Coords=="Dem. People's Republic of Korea"] <- "Korea, Dem. Rep."
+Cap_Coords[Cap_Coords=="Swaziland"] <- "Eswatini"
+Cap_Coords[Cap_Coords=="Gambia"] <- "Gambia, The"
+Cap_Coords[Cap_Coords=="China, Hong Kong SAR"] <- "Hong Kong"
+Cap_Coords[Cap_Coords=="Iran (Islamic Republic of)"] <- "Iran"
+Cap_Coords[Cap_Coords=="Republic of Korea"] <- "Korea, Rep."
+Cap_Coords[Cap_Coords=="Lao People's Democratic Republic"] <- "Laos"
+Cap_Coords[Cap_Coords=="China, Macao SAR"] <- "Macao"
+Cap_Coords[Cap_Coords=="Republic of Moldova"] <- "Moldova"
+Cap_Coords[Cap_Coords=="TFYR Macedonia"] <- "North Macedonia"
+Cap_Coords[Cap_Coords=="Saint Vincent and the Grenadines"] <- "St. Vincent and the Grenadines"
+Cap_Coords[Cap_Coords=="Saint Lucia"] <- "St. Lucia"
+Cap_Coords[Cap_Coords=="Saint Kitts and Nevis"] <- "St. Kitts and Nevis"
+Cap_Coords[Cap_Coords=="United Republic of Tanzania"] <- "Tanzania"
+Cap_Coords[Cap_Coords=="United States of America"] <- "United States"
+Cap_Coords[Cap_Coords=="Venezuela (Bolivarian Republic of)"] <- "Venezuela"
+Cap_Coords[Cap_Coords=="Viet Nam"] <- "Vietnam"
+
+```
+
+##Combining Datasets
+```{r message = FALSE, warning = FALSE}
+WB_GDP_merge <- WB_GDP_2 %>%
+  filter(Year %in% 1996:2022)
+
+FH_Index_merge <- FH_Index_2 %>%
+  filter(Year %in% 1996:2022,
+         CL %in% 1:7,
+         PR %in% 1:7) %>%
+  mutate(Year = as.integer(Year))
+
+WITS_merge <- WITS_3 %>%
+  mutate(Year = as.integer(Year))
+
+Ukraine_Shift <- WB_GDP_merge %>%
+  left_join(WITS_merge) %>%
+  left_join(FH_Index_merge) %>%
+  left_join(Cap_Coords)
+  
+#Adding Ukrainian data
+Ukraine_data <- Ukraine_Shift %>%
+  filter(Country == "Ukraine") %>%
+  select(Year, GDP, Latitude, Longitude, PR, CL) %>%
+  rename(UKR_GDP = GDP,
+         UKR_LAT = Latitude,
+         UKR_LON = Longitude,
+         UKR_CL = CL,
+         UKR_PR = PR)
+
+#Calculating the Distance using the Haversine formula.
+Ukraine_Gravity_Model <- Ukraine_Shift %>%
+  left_join(Ukraine_data) %>%
+  rowwise() %>%
+  mutate(Distance = distHaversine(c(Longitude, Latitude), c(UKR_LON, UKR_LAT)))
+
+write.csv(Ukraine_Gravity_Model, here("Data", "Ukraine_Gravity_Model.csv"), row.names = FALSE)
+```
+
+##Analysing the incompleteness of the dataset
+Some countries do not show up in all four datasets in any way, even after checking for different naming conventions. Here I will check if missing data on Trade for Ukraine is biased with some other indicators.
+
+```{r message = FALSE, warning = FALSE}
+Ukraine_Gravity_Model %>%
+  filter(is.na(GDP) | is.na(Total) | is.na(CL) | is.na(Distance)) %>%
+  n_distinct()
+
+#There are 1731 observations with some level of Missing Data
+
+summary(Ukraine_Gravity_Model)
+
+#Setting up a formula for the summary statistics
+missing_data_bias_sum <- function(name) {
+  name <- enquo(name)
+  
+  Ukraine_Gravity_Model %>%
+    filter(Country != "Ukraine") %>%
+    drop_na(!!name) %>%
+    mutate(TRADEna = ifelse(is.na(Total), 1, 0)) %>%
+    group_by(TRADEna) %>%
+    summarize(
+      Mean = mean(as.numeric(!!name), na.rm = TRUE),
+      Median = median(as.numeric(!!name), na.rm = TRUE),
+      StdDev = sd(as.numeric(!!name), na.rm = TRUE),
+      Min = min(as.numeric(!!name), na.rm = TRUE),
+      Max = max(as.numeric(!!name), na.rm = TRUE),
+      Count = n()
+    )
+}
+
+#Setting up a formula to get a t-test
+missing_data_bias_ttest <- function(name) {
+    name <- enquo(name)
+    
+without_NA <- Ukraine_Gravity_Model %>% 
+    filter(Country != "Ukraine") %>%
+    drop_na(!!name) %>%
+    mutate(TRADEna = ifelse(is.na(Total), 1, 0),
+           !!name := as.numeric(!!name)) %>%
+    filter(TRADEna == 0) %>% 
+    pull(!!name)
+
+with_NA <- Ukraine_Gravity_Model %>% 
+    filter(Country != "Ukraine") %>%
+    drop_na(!!name) %>%
+    mutate(TRADEna = ifelse(is.na(Total), 1, 0),
+           !!name := as.numeric(!!name)) %>%
+    filter(TRADEna == 1) %>% 
+    pull(!!name)
+
+t.test(without_NA, with_NA, var.equal = FALSE)
+}
+```
+
+##Running the missing data in trade bias with other variables.
+
+```{r message = FALSE, warning = FALSE}
+missing_data_bias_sum(GDP)
+missing_data_bias_ttest(GDP)
+#There is a bias towards lack of data on small economies.
+
+missing_data_bias_sum(Year)
+missing_data_bias_ttest(Year)
+#Trade data is less prevalent for earlier years.
+
+missing_data_bias_sum(CL)
+missing_data_bias_ttest(CL)
+missing_data_bias_sum(PR)
+missing_data_bias_ttest(PR)
+#Interestingly, although CL and PR tend to move together, there is only a significant relation between lower a Civil Liberty Index and missing data and not for Political Rights.
+
+missing_data_bias_sum(Latitude)
+missing_data_bias_ttest(Latitude)
+missing_data_bias_sum(Longitude)
+missing_data_bias_ttest(Longitude)
+#There seems to be significantly more missing data the more south a country is.
+
+missing_data_bias_sum(Distance)
+missing_data_bias_ttest(Distance)
+#The is significant evidence to suggest the further away a country is the more missing data there is.
+```
+
+##Data Preview
+Here we will do a few histograms of the data, each country-year pair is an observation, except for the Distance, where we take each country as an observation.
+
+```{r message = FALSE, warning = FALSE}
+#Distribution of GDP
+Ukraine_Gravity_Model %>%
+  ggplot(aes(x = GDP)) + 
+  geom_histogram(bins = 100, color = "black") + 
+  scale_x_log10(
+    breaks = c(1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13),
+    labels = c("10 M", "100 M", "1 B", "10 B", "100 B", "1 T", "10 T")
+  ) +
+  labs(
+    x = "GDP (Log Scale)",
+    y = "Frequency",
+    title = "Histogram of GDP"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+#Distribution of Trade
+Ukraine_Gravity_Model %>%
+  ggplot(aes(x = Total)) + 
+  geom_histogram(bins = 100, color = "black") + 
+  scale_x_log10(
+    breaks = c(1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7),
+    labels = c("1 k", "10 k", "100 k", "1 M", "10 M", "100 M", "1 B", "10 B") 
+  ) +
+  labs(
+    x = "Trade Volume (Log Scale)",
+    y = "Frequency",
+    title = "Histogram of Trade Volume"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+#Distribution of Civil Liberties and Political Rights
+Ukraine_Gravity_Model %>%
+  ggplot(aes(x = as.factor(CL))) +
+  geom_bar(color = "black") +
+  labs(
+    x = "CL (Index)",
+    y = "Frequency",
+    title = "Bar Chart of CL Index"
+  ) +
+  theme_minimal()
+
+Ukraine_Gravity_Model %>%
+  ggplot(aes(x = as.factor(PR))) +
+  geom_bar(color = "black") +
+  labs(
+    x = "PR (Index)",
+    y = "Frequency",
+    title = "Bar Chart of PR Index"
+  ) +
+  theme_minimal()
+
+#Distribution of Distance
+Ukraine_Gravity_Model %>%
+  distinct(Country, Distance, .keep_all = TRUE) %>%
+  ggplot(aes(x = Distance)) + 
+  geom_histogram(bins = 20, color = "black") + 
+  scale_x_log10(
+    breaks = c(5e5, 1e6, 2e6, 5e6, 1e7),
+    labels = c("500 km", "1000 km", "2000 km", "5000 km", "10000 km") 
+  ) +
+  labs(
+    x = "Distance (Log Scale)",
+    y = "Frequency",
+    title = "Histogram of Distance"
+  ) +
+  theme_minimal()
+
+Ukraine_Gravity_Model %>%
+  distinct(Country, Distance, .keep_all = TRUE) %>%
+  ggplot(aes(x = Distance)) + 
+  geom_histogram(bins = 20, color = "black") + 
+  scale_x_continuous(  # Change from scale_x_log10 to scale_x_continuous for linear scale
+    breaks = c(1e6, 5e6, 1e7, 15e6),
+    labels = c("1000 km","5000 km", "10000 km", "15000 km")
+  ) +
+  labs(
+    x = "Distance",
+    y = "Frequency",
+    title = "Histogram of Distance"
+  ) +
+  theme_minimal()
+
+```
